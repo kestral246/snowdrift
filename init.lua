@@ -23,6 +23,11 @@ local DASVAL = 159 -- Overcast sky RGB value in daytime (brightness)
 local FLAKRAD = 16 -- Radius in which flakes are created
 local DROPRAD = 16 -- Radius in which drops are created
 
+local SB_INTERVAL = 2 -- Overcast skybox update interval, [1,2,…)
+local FREEZE_STEP = 1 -- Rain/snow transition step size (in heat/humid units)
+local DRY_STEP = 1 -- Dry desert transition step size (in heat/humid units)
+local CLOUD_STEP = 1  -- Cloud density step size (in percent)
+
 -- Precipitation noise
 
 local np_prec = {
@@ -36,49 +41,44 @@ local np_prec = {
 	flags = "defaults"
 }
 
--- These 2 must match biome heat and humidity noise parameters for a world
+-- Enabling debug adds a HUD to display snowdrift state
+local debug = false
 
-local np_temp = {
-	offset = 50,
-	scale = 50,
-	spread = {x = 1000, y = 1000, z = 1000},
-	seed = 5349,
-	octaves = 3,
-	persist = 0.5,
-	lacunarity = 2.0,
-	flags = "defaults"
-}
+-- Valleys mapgen support (also must match world parameters)
+local altitude_chill = false
+local altitude_dry = false
+local alt_chill_dist = 90
 
-local np_humid = {
-	offset = 50,
-	scale = 50,
-	spread = {x = 1000, y = 1000, z = 1000},
-	seed = 842,
-	octaves = 3,
-	persist = 0.5,
-	lacunarity = 2.0,
-	flags = "defaults"
-}
+-- Snow/rain transition
+local freeze_pt = 35   -- valleys with altitude_* seems to like 32
+local freeze_step = FREEZE_STEP
+
+-- Desert transition
+local dry_step = DRY_STEP
+
+-- Cloud density change step (in hundredths)
+local cl_step = CLOUD_STEP
 
 -- End parameters
 
+-- Do files
+dofile(minetest.get_modpath("snowdrift") .. "/debug.lua")
 
 -- Some stuff
 
 local difsval = DASVAL - NISVAL
 local grad = 14 / 95
 local yint = 1496 / 95
+local yint_offset = dry_step * 93.9849250811  -- 95 * sqrt(95^2/(95^2+14^2))
 
 
 -- Initialise noise objects to nil
 
-local nobj_temp = nil
-local nobj_humid = nil
 local nobj_prec = nil
-
 
 -- Player tables
 
+local rain_level = {}
 local handles = {}
 local skybox = {} -- true/false. To not turn off skyboxes of other mods
 
@@ -86,6 +86,12 @@ local skybox = {} -- true/false. To not turn off skyboxes of other mods
 -- Globalstep function
 
 local timer = 0
+local cloud_state = {}
+
+minetest.register_on_joinplayer(function(player)
+		local player_name = player:get_player_name()
+		cloud_state[player_name] = { prlev=0, setval=44 }
+end)
 
 minetest.register_globalstep(function(dtime)
 	timer = timer + dtime
@@ -108,13 +114,25 @@ minetest.register_globalstep(function(dtime)
 			local pposz = math.floor(ppos.z)
 			local ppos = {x = pposx, y = pposy, z = pposz}
 
-			-- Heat and humidity calculations
-			local nobj_temp = nobj_temp or minetest.get_perlin(np_temp)
-			local nobj_humid = nobj_humid or minetest.get_perlin(np_humid)
+			-- Precipitation noise function
 			local nobj_prec = nobj_prec or minetest.get_perlin(np_prec)
-			local nval_temp = nobj_temp:get2d({x = pposx, y = pposz})
-			local nval_humid = nobj_humid:get2d({x = pposx, y = pposz})
+
+			local nval_temp = minetest.get_heat(ppos)
+			local nval_humid = minetest.get_humidity(ppos)
 			local nval_prec = nobj_prec:get2d({x = os.clock() / 60, y = 0})
+
+			-- valleys mapgen adjustments to temp and humidity based on elevation
+			local elev = pposy - 2
+			while elev > 0 and minetest.get_node({x=pposx, y=elev, z=pposz}).name == "air" do
+				elev = elev - 1
+			end
+			if altitude_chill then
+				nval_temp = nval_temp - (20 * elev / alt_chill_dist)
+			end
+			if altitude_dry then
+				nval_humid = nval_humid - (10 * elev / alt_chill_dist)
+			end
+
 			-- Biome system: Frozen biomes below heat 35,
 			-- deserts below line 14 * t - 95 * h = -1496
 			-- h = (14 * t + 1496) / 95
@@ -123,13 +141,101 @@ minetest.register_globalstep(function(dtime)
 			-- h - 14/95 t = 1496/95 y intersection
 			-- so area above line is
 			-- h - 14/95 t > 1496/95
-			local freeze = nval_temp < 35
-			local precip = nval_prec > PRECTHR and
-				nval_humid - grad * nval_temp > yint
+			--local freeze = nval_temp < 35
+			--local precip = nval_prec > PRECTHR and
+			--	nval_humid - grad * nval_temp > yint
+			local precip = nval_prec > PRECTHR
+
+			-- Create transition between precipitation levels
+			-- (0 = dry, to 4 = full precip)
+			-- Uses parallel desert lines spaced dry_step apart.
+			local heat_humid = 190*nval_humid - 28*nval_temp
+			local pr_maxlev
+			if heat_humid <= 2992 - 3 * yint_offset then
+				pr_maxlev = 0
+			elseif heat_humid <= 2992 - yint_offset then
+				pr_maxlev = 1
+			elseif heat_humid <= 2992 + yint_offset then
+				pr_maxlev = 2
+			elseif heat_humid <= 2992 + 3 * yint_offset then
+				pr_maxlev = 3
+			else
+				pr_maxlev = 4
+			end
+
+			-- define cloud density threshholds for each precip level
+			local pr_to_cl = function(i)
+				local table = { [0]=50, [1]=60, [2]=70, [3]=90, [4]=100 }
+				return table[i]
+			end
+
+			-- define non-precip cloud density based on local humidity
+			local hum_den = nval_humid * 0.4 + 20  -- cden = 20% - 60%
+
+			-- aliases for cloud state variables
+			local pr_level = cloud_state[player_name].prlev
+			local cl_setval = cloud_state[player_name].setval
+
+			if precip then -- increase or continue precip, unless pr_maxlev dropped
+				if pr_level < pr_maxlev then
+					if cl_setval < pr_to_cl(pr_level + 1) then
+						cloud_state[player_name].setval = cl_setval + cl_step
+					else
+						cloud_state[player_name].prlev = pr_level + 1  -- bump to next state
+					end
+				elseif pr_level > pr_maxlev then  -- entered dryer region
+					if cl_setval > pr_to_cl(pr_level - 1) then
+						cloud_state[player_name].setval = cl_setval - cl_step
+					else
+						cloud_state[player_name].prlev = pr_level - 1  -- drop state down
+					end
+				end
+			else -- gradually stop precip across the board
+				if pr_level > 0 then
+					if cl_setval > pr_to_cl(pr_level - 1) and cl_setval > hum_den then
+						cloud_state[player_name].setval = cl_setval - cl_step
+					else
+						cloud_state[player_name].prlev = pr_level - 1  -- drop state down
+					end
+				else  -- precip is done, gradually transition to non-precip cloud density
+					if cl_setval > hum_den + 1 then
+						cloud_state[player_name].setval = cl_setval - cl_step
+					elseif cl_setval < hum_den - 1 then
+						cloud_state[player_name].setval = cl_setval + cl_step
+					end
+				end
+			end
+
+			-- update aliases, in case either changed
+			pr_level = cloud_state[player_name].prlev
+			cl_setval = cloud_state[player_name].setval
+
+			-- clouds during precip max of precip value or humid-based value
+			-- no precip just uses humid-based value
+			-- local cur_den
+			local cloud_table = {}
+			if pr_level > 0 then  -- still have precip falling
+				cloud_table.density = math.max(cl_setval, hum_den) * 0.01
+			else
+				cloud_table.density = cl_setval * 0.01
+			end
+			player:set_clouds(cloud_table)
+
+			-- Create blending transition between all snow (freeze=0)
+			-- and all rain (freeze=4).
+			-- Uses freeze_pt and freeze_step to define.
+			local freeze
+			if nval_temp >= freeze_pt + 1.5*freeze_step then
+				freeze = 4
+			elseif nval_temp <= freeze_pt - 1.5*freeze_step then
+				freeze = 0
+			else
+				freeze = math.ceil((nval_temp - freeze_pt + 1.5*freeze_step)/freeze_step)
+			end
 
 			-- Set sky
-			if precip and not skybox[player_name] then
-				-- Set overcast sky only if normal
+			if pr_level == 4 then
+				-- check sky brightness
 				local sval
 				local time = minetest.get_timeofday()
 				if time >= 0.5 then
@@ -146,10 +252,14 @@ minetest.register_globalstep(function(dtime)
 					sval = math.floor(NISVAL +
 						((time - 0.1875) / 0.0521) * difsval)
 				end
-				player:set_sky({r = sval, g = sval, b = sval + 16, a = 255},
-					"plain", {}, false)
-				skybox[player_name] = true
-			elseif not precip and skybox[player_name] then
+				-- Set overcast sky only during max precip and if normal
+				if not skybox[player_name] or math.abs(skybox[player_name] - sval) >= SB_INTERVAL then
+					player:set_sky({r = sval, g = sval, b = sval + 16, a = 255},
+						"plain", {}, false)
+					skybox[player_name] = sval
+					--minetest.debug("changing skybox, sval = "..sval)
+				end
+			elseif pr_level ~= 4 and skybox[player_name] then
 				-- Set normal sky only if skybox
 				player:set_sky({}, "regular", {}, true)
 				skybox[player_name] = nil
@@ -157,19 +267,32 @@ minetest.register_globalstep(function(dtime)
 
 			-- Stop looping sound.
 			-- Stop sound if head below water level.
-			if not precip or freeze or pposy < YWATER then
+			if freeze == 0 or pr_level == 0 or pposy < YWATER then
 				if handles[player_name] then
 					minetest.sound_stop(handles[player_name])
 					handles[player_name] = nil
 				end
 			end
 
+			-- Display debug HUD
+			if debug then
+				local tenths = function(x)
+					return math.floor(10 * x + .5) / 10
+				end
+				player:hud_change(snowdrift_debug[player_name].id, "text",
+					tenths(nval_temp)..'°, '..tenths(nval_humid)..
+					'%, alt='..elev..', frz='..freeze..
+					', prlev='..pr_level..' / '..pr_maxlev..
+					', clden='..cl_setval/100 ..'  '..
+					snowdrift_disp_biomes(nval_temp, nval_humid, elev, 2.5))
+			end
+
 			-- Particles and sounds.
 			-- Only if head above water level.
-			if precip and pposy >= YWATER then
-				if freeze then
+			if pr_level > 0 and pposy >= YWATER then
+				if freeze <= 3 then
 					-- Snowfall particles
-					for lpos = 1, FLAKLPOS do
+					for lpos = 1, ((4-freeze)/4)*(pr_level/4)*FLAKLPOS do
 						local lposx = pposx - FLAKRAD +
 							math.random(0, FLAKRAD * 2)
 						local lposz = pposz - FLAKRAD +
@@ -200,9 +323,10 @@ minetest.register_globalstep(function(dtime)
 							})
 						end
 					end
-				else
+				end
+				if freeze >= 1 then
 					-- Rainfall particles
-					for lpos = 1, DROPLPOS do
+					for lpos = 1, (freeze/4)*(pr_level/4)*DROPLPOS do
 						local lposx = pposx - DROPRAD +
 							math.random(0, DROPRAD * 2)
 						local lposz = pposz - DROPRAD +
@@ -232,17 +356,33 @@ minetest.register_globalstep(function(dtime)
 						end
 					end
 					-- Start looping sound
-					if not handles[player_name] then
+					-- if not handles[player_name] then
+					if not handles[player_name] then  -- new sound
 						local handle = minetest.sound_play(
 							"snowdrift_rain",
 							{
 								to_player = player_name,
-								gain = RAINGAIN,
+								gain = RAINGAIN * (freeze * pr_level / 16),
 								loop = true,
 							}
 						)
 						if handle then
 							handles[player_name] = handle
+							rain_level[player_name] = freeze*pr_level
+						end
+					elseif rain_level[player_name] ~= freeze * pr_level then  -- volume change
+						minetest.sound_stop(handles[player_name])
+						local handle = minetest.sound_play(
+							"snowdrift_rain",
+							{
+								to_player = player_name,
+								gain = RAINGAIN * (freeze * pr_level / 16),
+								loop = true,
+							}
+						)
+						if handle then
+							handles[player_name] = handle
+							rain_level[player_name] = freeze*pr_level
 						end
 					end
 				end
@@ -268,6 +408,9 @@ end)
 
 minetest.register_on_leaveplayer(function(player)
 	local player_name = player:get_player_name()
+	if rain_level[player_name] then
+		rain_level[player_name] = nil
+	end
 	-- Stop sound if playing and remove handle
 	if handles[player_name] then
 		minetest.sound_stop(handles[player_name])
@@ -276,5 +419,8 @@ minetest.register_on_leaveplayer(function(player)
 	-- Remove skybox bool if necessary
 	if skybox[player_name] then
 		skybox[player_name] = nil
+	end
+	if cloud_state[player_name] then
+		cloud_state[player_name] = nil
 	end
 end)
