@@ -1,20 +1,20 @@
 -- Parameters
 
 local YWATER = 1 -- Normally set this to world's water level
-					-- Particles are timed to disappear at this y
-					-- Particles are not spawned for players below this y
-					-- Rain sound is not played for players below this y
+				-- Particles are timed to disappear at this y
+				-- Particles are not spawned for players below this y
+				-- Rain sound is not played for players below this y
 local YMIN = -48 -- Normally set this to deepest ocean
 local YMAX = 120 -- Normally set this to cloud level
 					-- Weather does not occur for players outside this y range
-local PRECTIM = 5 -- Precipitation noise 'spread'
-					-- Time scale for precipitation variation, in minutes
+local PRECTIM = 300 -- Precipitation noise 'spread'
+					-- Time scale for precipitation variation, in seconds
 local PRECTHR = 0.2 -- Precipitation noise threshold, -1 to 1:
-					-- -1 = precipitation all the time
-					-- 0 = precipitation half the time
-					-- 1 = no precipitation
+				-- -1 = precipitation all the time
+				-- 0 = precipitation half the time
+				-- 1 = no precipitation
 local FLAKLPOS = 32 -- Snowflake light-tested positions per 0.5s cycle
-					-- Maximum number of snowflakes spawned per 0.5s
+				-- Maximum number of snowflakes spawned per 0.5s
 local DROPLPOS = 64 -- Raindrop light-tested positions per 0.5s cycle
 local DROPPPOS = 2 -- Number of raindrops spawned per light-tested position
 local RAINGAIN = 0.2 -- Rain sound volume
@@ -71,7 +71,6 @@ local grad = 14 / 95
 local yint = 1496 / 95
 local yint_offset = dry_step * 93.9849250811  -- 95 * sqrt(95^2/(95^2+14^2))
 
-
 -- Initialise noise objects to nil
 
 local nobj_prec = nil
@@ -84,6 +83,9 @@ local skybox = {} -- true/false. To not turn off skyboxes of other mods
 
 
 -- Globalstep function
+
+local os_time_0 = os.time()
+local t_offset = math.random(0, 300000)
 
 local timer = 0
 local cloud_state = {}
@@ -103,23 +105,26 @@ minetest.register_globalstep(function(dtime)
 
 	for _, player in ipairs(minetest.get_connected_players()) do
 		local player_name = player:get_player_name()
-		local ppos = player:getpos()
+		local ppos = player:get_pos()
 		-- Point just above player head, to ensure precipitation when swimming
 		local pposy = math.floor(ppos.y) + 2
 		if pposy >= YMIN and pposy <= YMAX then
-			--TODO Predict player position? Only horizontally
-			--local ppos = vector.add(player:getpos(),
-			--vector.multiply(player:get_player_velocity(), ?))
 			local pposx = math.floor(ppos.x)
 			local pposz = math.floor(ppos.z)
 			local ppos = {x = pposx, y = pposy, z = pposz}
 
-			-- Precipitation noise function
+			-- Heat, humidity and precipitation noises
+
+			-- Time in seconds.
+			-- Add the per-server-session random time offset to avoid identical behaviour
+			-- each server session.
+			local time = os.difftime(os.time(), os_time_0) - t_offset
+
 			local nobj_prec = nobj_prec or minetest.get_perlin(np_prec)
 
 			local nval_temp = minetest.get_heat(ppos)
 			local nval_humid = minetest.get_humidity(ppos)
-			local nval_prec = nobj_prec:get2d({x = os.clock() / 60, y = 0})
+			local nval_prec = nobj_prec:get_2d({x = time, y = 0})
 
 			-- valleys mapgen adjustments to temp and humidity based on elevation
 			local elev = pposy - 2
@@ -133,14 +138,16 @@ minetest.register_globalstep(function(dtime)
 				nval_humid = nval_humid - (10 * elev / alt_chill_dist)
 			end
 
-			-- Biome system: Frozen biomes below heat 35,
+			-- Default Minetest Game biome system:
+			-- Frozen biomes below heat 35
 			-- deserts below line 14 * t - 95 * h = -1496
 			-- h = (14 * t + 1496) / 95
 			-- h = 14/95 * t + 1496/95
-			-- where 14/95 is gradient and 1496/95 is y intersection
-			-- h - 14/95 t = 1496/95 y intersection
+			-- where 14/95 is gradient and 1496/95 is 'y-intersection'
+			-- h - 14/95 * t = 1496/95
 			-- so area above line is
-			-- h - 14/95 t > 1496/95
+			-- h - 14/95 * t > 1496/95
+
 			--local freeze = nval_temp < 35
 			--local precip = nval_prec > PRECTHR and
 			--	nval_humid - grad * nval_temp > yint
@@ -254,14 +261,18 @@ minetest.register_globalstep(function(dtime)
 				end
 				-- Set overcast sky only during max precip and if normal
 				if not skybox[player_name] or math.abs(skybox[player_name] - sval) >= SB_INTERVAL then
-					player:set_sky({r = sval, g = sval, b = sval + 16, a = 255},
-						"plain", {}, false)
+					player:set_sky({["base_color"]=sval*0x010101+16; ["type"]="plain"; ["clouds"]=false})
+					player:set_sun({["visible"]=false, ["sunrise_visible"]=false})
+					player:set_moon({["visible"]=false})
+					player:set_stars({["visible"]=false})
 					skybox[player_name] = sval
-					--minetest.debug("changing skybox, sval = "..sval)
 				end
 			elseif pr_level ~= 4 and skybox[player_name] then
 				-- Set normal sky only if skybox
-				player:set_sky({}, "regular", {}, true)
+				player:set_sky()  -- default
+				player:set_sun()
+				player:set_moon()
+				player:set_stars()
 				skybox[player_name] = nil
 			end
 
@@ -279,12 +290,15 @@ minetest.register_globalstep(function(dtime)
 				local tenths = function(x)
 					return math.floor(10 * x + .5) / 10
 				end
+				local spn = 'nil'
+				if skybox[player_name] then spn = skybox[player_name] end
 				player:hud_change(snowdrift_debug[player_name].id, "text",
 					tenths(nval_temp)..'°, '..tenths(nval_humid)..
 					'%, alt='..elev..', frz='..freeze..
 					', prlev='..pr_level..' / '..pr_maxlev..
-					', clden='..cl_setval/100 ..'  '..
-					snowdrift_disp_biomes(nval_temp, nval_humid, elev, 2.5))
+					', clden='..cl_setval/100 ..
+					', skybox='..spn..
+					'  '..snowdrift_disp_biomes(nval_temp, nval_humid, elev, 2.5))
 			end
 
 			-- Particles and sounds.
@@ -396,7 +410,10 @@ minetest.register_globalstep(function(dtime)
 			end
 			-- Set normal sky if skybox
 			if skybox[player_name] then
-				player:set_sky({}, "regular", {}, true)
+				player:set_sky()  -- default
+				player:set_sun()
+				player:set_moon()
+				player:set_stars()
 				skybox[player_name] = nil
 			end
 		end

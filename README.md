@@ -1,6 +1,6 @@
 Snowdrift
 =========
-Extensions to **snowdrift 0.6.3** by **paramat**
+Extensions to **snowdrift 0.6.4** by **paramat**
 
 For Minetest 5.0.0 and later.
 
@@ -8,10 +8,17 @@ Depends: default
 
 Changes
 -------
+**new**
+
+- Finally merged in paramat's 0.6.4 changes.
+- Updated to use get_pos() and get_2d().
+- Updated to use set_sky(sky_parameters).
+
+
 I've tried to make the abrupt transitions in this mod a little smoother.
 
 - Cloud cover gradually increases before rain starts, and gradually decreases after rain stops.
-- Fully overcast skies gradually lighten and darken at dawn and dusk.
+- Fully overcast skies gradually darken after dusk and lighten before dawn.
 - Amount of rain and/or snow falling gradually increases or decreases.
 - Crossing into or out of dry desert biomes gradually decreases or increases amount of precipitation.
 - Crossing into or out of freezing biomes gradually shifts percentage of rain versus snow.
