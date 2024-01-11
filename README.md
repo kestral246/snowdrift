@@ -6,6 +6,8 @@ For Minetest 5.0.0 and later.
 
 Depends: default
 
+**Note:** To use this mod, Minetest Game's "Enable weather" option needs to be disabled.
+
 Changes
 -------
 **new**
