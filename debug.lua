@@ -85,7 +85,7 @@ end
 
 minetest.register_on_joinplayer(function(player)
 		local pname = player:get_player_name()
-		snowdrift_debug[pname] = {id = player:hud_add({hud_elem_type = "text",
+		snowdrift_debug[pname] = {id = player:hud_add({type = "text",
 				position = {x=0.5, y=0.1},
 				text = " ",
 				number = 0xFF0000}),  -- red text
